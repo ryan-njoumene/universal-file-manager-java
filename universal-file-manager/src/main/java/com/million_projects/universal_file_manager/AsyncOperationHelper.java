@@ -21,7 +21,7 @@ public final class AsyncOperationHelper {
     private AsyncOperationHelper(){}
 
         // STATIC METHODS
-    public static <T> CompletableFuture<T> executeRead(
+    public static <T> CompletableFuture< Result<T> > executeRead(
             ExecutorService executor,
             File fileToRead,
             String dataFormat,
@@ -36,19 +36,19 @@ public final class AsyncOperationHelper {
             try {
                 if (!fileToRead.exists()) {
                     logger.error("Error: {} File not found at " + fileToRead.getAbsolutePath(), dataFormat);
-                    throw new IOException(dataFormat + " file not found: " + fileToRead.getAbsolutePath());
+                    return Result.failure( new IOException(dataFormat + " file not found: " + fileToRead.getAbsolutePath()) );
                 }
                 else{
                     logger.debug("{} Thread {}: Reading {} from {}", currentThreadType, Thread.currentThread().getName(), dataFormat, fileToRead.getName());
                     T result = ioOperation.call(); // Execute the actual I/O operation
                     logger.info("{} Thread {}: Finished reading {} from {}", currentThreadType, Thread.currentThread().getName(), dataFormat, fileToRead.getName());
-                    return result;
+                    return Result.success(result);
                 }
             } 
             catch (Throwable e) {
                 // catch IOException that result from ioOperation.call()
                 logger.error("{} Thread {}: Error reading {} from {}: {}", currentThreadType, Thread.currentThread().getName(), dataFormat, fileToRead.getName(), e.getMessage(), e);
-                throw new FileHandlingException("Failed to read " + dataFormat + " file: " + fileToRead.getName(), e);
+                return Result.failure( new FileHandlingException("Failed to read " + dataFormat + " file: " + fileToRead.getName(), e) );
             }
         }, executor);        
     }
@@ -73,29 +73,43 @@ public final class AsyncOperationHelper {
         return writefuture; // Join to wait for this specific Virtual Thread to complete        
     }
 
-    public static <T> CompletableFuture<T> executeCallback(
-        CompletableFuture<T> future,
-        File file,
-        String dataFormat,
-        Object contentToWrite,
-        String actionExecuted
-    ){
+
+    public static <T> CompletableFuture<T> executeCallbacks(
+            CompletableFuture<T> future, // Generic type, can be Result<X> or Void or String etc.
+            File file,
+            String dataFormat,
+            String actionExecuted // e.g., "reading", "writing"
+    ) {
         String capitalizedActionExecuted = actionExecuted.substring(0,1).toUpperCase() + actionExecuted.substring(1);
-        // Attach callbacks to the CompletableFuture
-        future.thenRun(() -> {
-            logger.info("Callback (thenRun): {} file {} operation completed successfully!", contentToWrite.getClass(), actionExecuted);
-        }).exceptionally(ex -> {
-            logger.warn("Callback: {} file {} operation failed with: {}", file.getName(), actionExecuted, ex.getMessage());
-            return null; // Return null to indicate the exception was handled
-        }).whenComplete((result, ex) -> {
-            // This callback runs whether the task succeeds or fails
+
+        future.whenComplete((result, ex) -> {
+            // 'result' here will be the actual value (e.g., Result<Player> for reads, null for writes)
+
             if (ex == null) {
-                logger.info("Callback (whenComplete): {} {} Task finished without exception.", dataFormat, capitalizedActionExecuted);
+                // Success path (No Exception Currently Triggered)
+                if (result instanceof Result) { // Check if it's a Result<T> (for reads)
+                    Result<?> fileResult = (Result<?>) result; // Cast to Result<?> to access isSuccess/isFailure
+                    if (fileResult.isSuccess()) {
+                        logger.info("Callback (whenComplete): {} {} operation for {} completed successfully! Value type: {}",
+                                    dataFormat, capitalizedActionExecuted, file.getName(),
+                                    fileResult.getValue().get().getClass().getSimpleName());
+                    } else {
+                        logger.warn("Callback (whenComplete): {} {} operation for {} completed with failure: {}",
+                                    dataFormat, capitalizedActionExecuted, file.getName(),
+                                    fileResult.getError().get().getMessage() );
+                    }
+                } else {
+                    // Assume it's a CompletableFuture<Void> (or other simple type) for writes/simple tasks
+                    logger.info("Callback (whenComplete): {} {} operation for {} completed successfully.",
+                                dataFormat, capitalizedActionExecuted, file.getName());
+                }
             } else {
-                logger.warn("Callback (whenComplete): {} {} Task finished with exception: " + ex.getCause().getMessage(), dataFormat, capitalizedActionExecuted);
+                // Failure path (ex is not null)
+                logger.warn("Callback (whenComplete): {} {} operation for {} finished with exception: {}",
+                            dataFormat, capitalizedActionExecuted, file.getName(), ex.getMessage());
             }
         });
-        return future; // Join to wait for this specific Virtual Thread to complete
+        return future; // Return the original future, unchanged in type or value
     }    
 
 }

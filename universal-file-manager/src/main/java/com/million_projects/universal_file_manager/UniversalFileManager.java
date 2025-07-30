@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 
@@ -71,7 +72,7 @@ public class UniversalFileManager {
      * @return A CompletableFuture containing the file content as a String.
      * @throws NoSuitableFileHandlerException if no handler can read the file as text.
      */
-    public CompletableFuture<String> readTextFromFile(ExecutorService executor, File fileToRead) {
+    public <T> CompletableFuture< Result<String> > readTextFromFile(ExecutorService executor, File fileToRead) {
         // iterates through its registered handlers, checks canHandle(), and then delegates the actual work to the first suitable handler found.
         Optional<TextFileHandler> handler = this.handlers.stream()
                 .filter(h -> h instanceof TextFileHandler)
@@ -126,7 +127,7 @@ public class UniversalFileManager {
      * @return A CompletableFuture containing the deserialized object.
      * @throws NoSuitableFileHandlerException if no handler can read the file as an object.
      */
-    public <T> CompletableFuture<T> readObjectFromFile(ExecutorService executor, File fileToRead, Class<T> classToDeserialize) {
+    public <T> CompletableFuture< Result<T> > readObjectFromFile(ExecutorService executor, File fileToRead, Class<T> classToDeserialize) {
         // iterates through its registered handlers, checks canHandle(), and then delegates the actual work to the first suitable handler found.
         Optional<ObjectFileHandler> handler = this.handlers.stream()
                 .filter(h -> h instanceof ObjectFileHandler)
@@ -181,7 +182,7 @@ public class UniversalFileManager {
      * @return A CompletableFuture containing the deserialized object.
      * @throws NoSuitableFileHandlerException if no handler can read the file as an object.
      */
-    public CompletableFuture<byte[]> readBytesFromFile(ExecutorService executor, File fileToRead) {
+    public <T> CompletableFuture< Result<T> > readBytesFromFile(ExecutorService executor, File fileToRead) {
         // iterates through its registered handlers, checks canHandle(), and then delegates the actual work to the first suitable handler found.
         Optional<BinaryFileHandler> handler = this.handlers.stream()
                 .filter(h -> h instanceof BinaryFileHandler)
@@ -226,89 +227,115 @@ public class UniversalFileManager {
 
 
     // ==> Read Many File of Any Type
-    public <T> Map<String, T> readManyFileBlocking(ExecutorService executor, Map<String, Class<?> > fileAndTypes, boolean ToleratePartialFailures){
-        Map<String, CompletableFuture<T>> futuresMap = new HashMap<>();
+    public <T> Map<String, Result<T> > readManyFileBlocking(ExecutorService executor, Map<String, Class<?> > fileAndTypes, boolean toleratePartialFailures){
+        logger.info("Main thread: Initiating blocking asynchronous reads for {} files using Async Thread Executor...", fileAndTypes.size() );
+        Map<String, CompletableFuture< Result<T> >> futuresMap = new HashMap<>();
 
         for (Map.Entry<String, Class<?>> entry : fileAndTypes.entrySet()) {
             String fileName = entry.getKey();
             Class<?> targetClass = entry.getValue();
             File fileToRead = new File(fileName);
             
-            CompletableFuture<T> individualFuture = (CompletableFuture<T>) handlePartialFailures(executor, fileToRead, targetClass, ToleratePartialFailures);
-            futuresMap.put(fileName, individualFuture);
+            CompletableFuture<Result<T>> rawFuture = readAnyFile(executor, fileToRead, (Class<T>) targetClass);
+            rawFuture = handlePartialFailures(fileToRead, rawFuture, toleratePartialFailures);
+
+            futuresMap.put(fileName, rawFuture);
         }
         CompletableFuture<Void> allFutures = CompletableFuture.allOf(futuresMap.values().toArray(new CompletableFuture[0]));
-        allFutures.join();
-        logger.info("Main thread: All asynchronous file read initiated and joined.");
+        
+        try {
+            allFutures.join(); // This will block. If toleratePartialFailures is false and an error occurs, this line will throw.
+        } catch (CompletionException e) {
+            // If not tolerating partial failures, and an exception occurred, re-throw it.
+            if (!toleratePartialFailures) {
+                logger.error("Batch file reading failed (not tolerating partial failures). Overall exception: {}", e.getMessage(), e);
+                throw new FileHandlingException("Batch file reading failed due to critical errors.", e);
+            }
+            // This else block should not be reached if toleratePartialFailures is true,
+            // as allFutures.join() would not throw in that case.
+            logger.error("Unexpected CompletionException caught in blocking read: {}", e.getMessage(), e);
+        }
 
-        Map<String, T> loadedData = new HashMap<>();
-        for (Map.Entry<String, CompletableFuture<T>> entry : futuresMap.entrySet()) {
+        logger.info("Main thread: All asynchronous file read initiated and joined.");
+        Map<String, Result<T> > loadedData = new HashMap<>();
+
+        for (Map.Entry<String, CompletableFuture< Result<T> >> entry : futuresMap.entrySet()) {
             String fileName = entry.getKey();
-            CompletableFuture<T> future = entry.getValue();
+            CompletableFuture< Result<T> > future = entry.getValue();
             try {
                 // Get the actual object from the completed future
-                T dataRead = future.get();
-                loadedData.put(fileName, dataRead);
-                logger.debug("Successfully loaded {} for file {}", dataRead.getClass().getSimpleName(), fileName);
+                Result<T> fileResult = future.get();
+                loadedData.put(fileName, fileResult);
+                if(fileResult.isSuccess()){
+                    logger.debug("Successfully loaded {} for file {}", fileResult.getValue().get().getClass().getSimpleName(), fileName);
+                } 
+                else{
+                    logger.warn("File {} failed to load, recorded as null.", fileName);
+                }
+
             } catch (InterruptedException | ExecutionException e) {
-                // e.getCause() != null: This checks if there is an underlying cause for the ExecutionException
-                // if true then e.getCause().getMessage() (exist only for ExecutionException)
-                // if false then e.getMessage() is evaluated. (happen in some edge cases or if e is an InterruptedException)
-                logger.error("Error retrieving object for file {}: {}", fileName, e.getCause() != null ? e.getCause().getMessage() : e.getMessage(), e);
-                loadedData.put(fileName, null);
+                // This catch block should only be hit for unexpected errors in the future's plumbing,
+                // or if an InterruptedException occurs.
+                logger.error("Unexpected error retrieving future result for file {}: {}", fileName, e.getMessage(), e);
+                loadedData.put(fileName, Result.failure(e)); // Fallback for unexpected errors
             }
         }
         return loadedData;
     }
 
-    public <T> CompletableFuture< Map<String, T> > readManyFileNonBlocking(ExecutorService executor, Map<String, Class<?> > fileAndTypes, boolean toleratePartialFailures){
-        Map<String, CompletableFuture<T>> futuresMap = new HashMap<>();
+    public <T> CompletableFuture< Map<String, Result<T> > > readManyFileNonBlocking(ExecutorService executor, Map<String, Class<?> > fileAndTypes, boolean toleratePartialFailures){
+        Map<String, CompletableFuture< Result<T> >> futuresMap = new HashMap<>();
 
         for (Map.Entry<String, Class<?>> entry : fileAndTypes.entrySet()) {
             String fileName = entry.getKey();
             Class<?> targetClass = entry.getValue();
             File fileToRead = new File(fileName);
             
-            CompletableFuture<T> individualFuture = (CompletableFuture<T>) handlePartialFailures(executor, fileToRead, targetClass, toleratePartialFailures);
-            futuresMap.put(fileName, individualFuture);
+            CompletableFuture<Result<T>> rawFuture = readAnyFile(executor, fileToRead, (Class<T>) targetClass);
+            rawFuture = handlePartialFailures(fileToRead, rawFuture, toleratePartialFailures);
+
+            futuresMap.put(fileName, rawFuture );
         }
         CompletableFuture<Void> allFutures = CompletableFuture.allOf(futuresMap.values().toArray(new CompletableFuture[0]));
 
-        return allFutures.thenApply(voidResult -> {
+        CompletableFuture< Map<String, Result<T> > > mappedData = allFutures.thenApply(voidResult -> {
             logger.info("Background thread: All asynchronous file reads completed. Compiling results.");
-            Map<String, T> loadedData = new HashMap<>();
-            for (Map.Entry<String, CompletableFuture<T>> entry : futuresMap.entrySet()) {
+            Map<String, Result<T> > loadedData = new HashMap<>();
+            for (Map.Entry<String, CompletableFuture< Result<T> >> entry : futuresMap.entrySet()) {
                 String fileName = entry.getKey();
-                CompletableFuture<T> future = entry.getValue();
+                CompletableFuture< Result<T> > future = entry.getValue();
                 try {
                     // get() is safe here because allFutures.thenApply() only runs after all futures are done
-                    T dataRead = future.get();
-                    loadedData.put(fileName, dataRead);
-                    if(dataRead != null){
-                        logger.debug("Successfully loaded {} for file {}", dataRead.getClass().getSimpleName(), fileName);
-                    }
+                    Result<T> fileResult = future.get();
+                    loadedData.put(fileName, fileResult);
+
+                    if(fileResult.isSuccess()){
+                        logger.debug("Successfully loaded {} for file {}", fileResult.getValue().get().getClass().getSimpleName(), fileName);
+                    } 
                     else{
-                        logger.debug("File {} failed to load, recorded as null.", fileName);
+                        logger.warn("File {} failed to load, recorded as null.", fileName);
                     }
+
                 } catch (InterruptedException | ExecutionException e) {
-                    logger.error("Unexpected error retrieving handled future result for file {}: {}", fileName, e.getMessage(), e);
-                    loadedData.put(fileName, null);
+                    // should not reach this point if everything is properly setup
+                    logger.error("Unexpected critical error retrieving future result for file {}: {}", fileName, e.getMessage(), e);
+                    loadedData.put(fileName, Result.failure(e) ); // return the unexpected error
                 }
             }
             return loadedData;
-        })
-        // Add an exceptionally handler for the overall batch if toleratePartialFailures is false
-        .exceptionally(ex -> {
-            if (!toleratePartialFailures) {
-                logger.error("Batch file reading failed (not tolerating partial failures): {}", ex.getMessage(), ex);
-                throw new FileHandlingException("Batch file reading failed for critical errors.", ex);
-            }
-            logger.error("Unexpected exceptional completion of batch future: {}", ex.getMessage(), ex);
-            return new HashMap<>(); // Fallback
         });
+            if (!toleratePartialFailures) {
+                return mappedData.exceptionally(ex -> {
+                // This block executes ONLY if toleratePartialFailures was FALSE,
+                // AND allFutures (and thus one of the rawFutures) completed exceptionally.
+                logger.error("Batch file reading failed (not tolerating partial failures). Overall exception: {}", ex.getMessage(), ex);
+                throw new FileHandlingException("Batch file reading failed due to critical errors.", ex);
+            });
+        }
+        return mappedData;
     }    
 
-    public <T> CompletableFuture<T> readAnyFile(ExecutorService executor, File fileToRead, Class<T> targetClass){
+    public <T> CompletableFuture< Result<T> > readAnyFile(ExecutorService executor, File fileToRead, Class<T> targetClass){
 
         // iterates through its registered handlers, checks canHandle(), and then delegates the actual work to the first suitable handler found.
         Optional<UniversalFileHandler> handler = this.handlers.stream()
@@ -371,20 +398,26 @@ public class UniversalFileManager {
         return option;
     }
 
-    private <T> CompletableFuture<T> handlePartialFailures(ExecutorService executor, File fileToRead, Class<T> targetClass, boolean ToleratePartialFailures){
-        if(!ToleratePartialFailures){
-            return readAnyFile(executor, fileToRead, (Class<T>) targetClass);
+    private <T> CompletableFuture< Result<T> > handlePartialFailures( File fileToRead, CompletableFuture<Result<T>> rawFuture, boolean toleratePartialFailures){
+        CompletableFuture<Result<T>> individualFuture;
+
+        if (toleratePartialFailures) {
+            // If true, we "handle" the exception at the individual future level.
+            // This means the individualFuture itself will always complete successfully,
+            // but its contained Result<T> will be a Failure if an error occurred.
+            individualFuture = rawFuture.handle((result, ex) -> {
+                if (ex != null) {
+                    logger.warn("Individual file read failed for {}: {}", fileToRead.getName(), ex.getMessage());
+                    return Result.failure(ex); // Return a Failure Result
+                }
+                return result; // Return the successful Result
+            });
+        } else {
+            // If false, we do NOT handle the exception at the individual future level.
+            // If rawFuture completes exceptionally, it remains exceptional.
+            individualFuture = rawFuture; // Propagate exception if not tolerating
         }
-        CompletableFuture<T> individualFuture = readAnyFile(executor, fileToRead, (Class<T>) targetClass);
-        // Use handle() to convert exceptional completion to successful completion with null
-        CompletableFuture<T> handledFuture = individualFuture.handle((result, ex) -> {
-            if (ex != null) {
-                logger.warn("Individual file read failed for {}: {}", fileToRead.getName(), ex.getMessage());
-                return null; // Return null on failure, so allOf() sees it as successful
-            }
-            return result;
-        });
-        return handledFuture;
+        return individualFuture;
     }
 
 

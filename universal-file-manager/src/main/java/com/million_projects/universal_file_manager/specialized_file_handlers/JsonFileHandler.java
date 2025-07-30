@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.million_projects.universal_file_manager.AsyncOperationHelper;
+import com.million_projects.universal_file_manager.Result;
 import com.million_projects.universal_file_manager.generic_file_handlers.ObjectFileHandler;
 
 public class JsonFileHandler implements ObjectFileHandler{
@@ -35,7 +36,7 @@ public class JsonFileHandler implements ObjectFileHandler{
     }
 
     @Override
-    public <T> CompletableFuture<T> read(ExecutorService executor, File fileToRead, Object option){
+    public <T> CompletableFuture< Result<T> > read(ExecutorService executor, File fileToRead, Class<?> option){
         return readObject(executor, fileToRead, (Class<T>) option);
     }
 
@@ -45,16 +46,16 @@ public class JsonFileHandler implements ObjectFileHandler{
     }
 
     @Override
-    public <T> CompletableFuture<T> readObject(ExecutorService executor, File fileToRead, Class<T> classToDeserialize){
-        CompletableFuture<T> readfuture = deserializeObject(executor, fileToRead, classToDeserialize);
-        readfuture = AsyncOperationHelper.executeCallback(readfuture, fileToRead, DATA_FORMAT, classToDeserialize, "reading");
-        return readfuture;
+    public <T> CompletableFuture< Result<T> > readObject(ExecutorService executor, File fileToRead, Class<T> classToDeserialize){
+        CompletableFuture< Result<T> > readfuture = deserializeObject(executor, fileToRead, classToDeserialize);
+        return AsyncOperationHelper.executeCallbacks(readfuture, fileToRead, DATA_FORMAT, "reading");
+        //return readfuture;
     }
 
     @Override
     public CompletableFuture<Void> writeObject(ExecutorService executor, File fileToWrite, Object objectToWrite){
         CompletableFuture<Void> writeFuture = serializeObject(executor, fileToWrite, objectToWrite);
-        writeFuture = AsyncOperationHelper.executeCallback(writeFuture, fileToWrite, DATA_FORMAT, objectToWrite, "writing");
+        writeFuture = AsyncOperationHelper.executeCallbacks(writeFuture, fileToWrite, DATA_FORMAT, "writing");
         return writeFuture;
     };
 
@@ -69,7 +70,7 @@ public class JsonFileHandler implements ObjectFileHandler{
      * @param <T> The type of the object to deserialize.
      * @return A CompletableFuture that will contain the deserialized object, or complete exceptionally.
      */
-    public <T> CompletableFuture<T> deserializeObject(ExecutorService executor, File fileToRead, Class<T> classToDeserialize){
+    public <T> CompletableFuture< Result<T> > deserializeObject(ExecutorService executor, File fileToRead, Class<T> classToDeserialize){
         return AsyncOperationHelper.executeRead(executor, fileToRead, DATA_FORMAT, () -> {
             // This is the specific I/O operation for JSON deserialization
             return objectMapper.readValue(fileToRead, classToDeserialize);
